@@ -763,7 +763,6 @@ async fn run(cli: Cli, fmt: OutputFormat) -> Result<(), CliError> {
             } else {
                 args.format
             };
-            let source = c.download_source(args.source, format).await?;
             if clips.is_empty() {
                 return Err(CliError::NotFound(format!("clip: {}", args.ids.join(", "))));
             }
@@ -783,7 +782,7 @@ async fn run(cli: Cli, fmt: OutputFormat) -> Result<(), CliError> {
                 // streaming, deleted mid-batch) must not sink the rest.
                 let result: Result<String, CliError> = async {
                     let path =
-                        download::download_clip(&c, clip, &out_dir, format, source, cli.quiet)
+                        download::download_clip(&c, clip, &out_dir, format, args.source, cli.quiet)
                             .await?;
                     if format == DownloadFormat::Mp3 {
                         let plain_lyrics = clip.metadata.prompt.as_deref();

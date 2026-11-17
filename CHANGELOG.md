@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — Mango playback-source decryption & free-tier fixes
+
+- **Mango playback-source download (`--source mango`, now default):** Integrated the Mango playback decryption flow from `suno-downloader` (`POST /api/mango/rights`, `SHA-256(jwt/glt)` KEK derivation, `AES-256-GCM` key/iv unwrapping with clip ID as AAD, and local `AES-128-CTR` stream decryption). Works on free/non-subscribed accounts where official export quota (`current_period_downloads_limit: 0`) is exhausted.
+- **Local `ffmpeg` transcoding:** When downloading via `mango`, `--format m4a` saves the decrypted lossless container directly without transcoding; `--format mp3`, `wav`, and `mp4` automatically transcode via local `ffmpeg` (preserving ID3 plain + synced lyric embedding on MP3 and cover art synthesis on MP4).
+- **Free-tier `BillingInfo` deserialization fix:** `GET /api/billing/info/` returns `"plan": null` on free accounts; `BillingInfo.plan` now deserializes `null` into a default `"Free"` plan instead of failing with `error decoding response body`.
+- **Full multiline UUID in `suno list`:** The `ID` column in table output now wraps all 5 UUID segments across multiple lines instead of truncating to 8 characters.
+- **Skills updated:** Updated `assets/SKILL.md` and `agent-info` manifest to reflect `--source mango` as the default download source.
+
 ## v0.10.1 — v6 catalogue, resumable jobs, and signed downloads
 
 - Added Turnstile provider detection, numeric `--token-provider`, and the website's hCaptcha fallback. Captcha calls have absolute deadlines; `--quiet` keeps failures machine-readable.

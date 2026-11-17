@@ -204,7 +204,7 @@ suno models          List available models with limits
 ### Manage
 
 ```
-suno download <ids>  Download MP3/WAV/M4A/MP4 through signed preparation APIs
+suno download <ids>  Download MP3/WAV/M4A/MP4 (--source mango by default, or auto/studio/library)
 suno delete <ids>    Move clips to trash (--confirm or -y; --restore undoes it)
 suno set <id>        Update title, lyrics, caption, or remove cover
 suno publish <ids>   Toggle public/private visibility
@@ -373,18 +373,18 @@ suno status <clip_id_1> <clip_id_2> --wait --download ./songs/
 
 The CLI writes a durable receipt before submission. Reusing a request ID with the same payload returns its saved clip IDs; a changed payload or an outcome-unknown receipt is rejected rather than submitted again. Receipts contain the payload hash, state, IDs, and recovery action. They omit credentials, tokens, and lyrics. `--download` implies `--wait`, and completed clips returned by `generate`, `describe`, `cover`, `remaster`, or `status` include `local_path` after download.
 
-### Signed downloads
+### Downloads (Mango playback decryption & signed preparation)
 
-Downloads use Suno's signed preparation APIs:
+Downloads default to `--source mango` (playback-source AES-GCM/AES-CTR decryption with local `ffmpeg` transcoding when needed), and also support Suno's signed preparation APIs (`--source auto`, `studio`, or `library`):
 
 ```bash
-suno download <id1> <id2> --format mp3 --source auto --output ./songs/
+suno download <id1> <id2> --format mp3 --source mango --output ./songs/
+suno download <id> --format m4a --source mango --output ./songs/
 suno download <id> --format wav --source studio --output ./exports/
-suno download <id> --format m4a --source library --output ./songs/
 suno download <id> --format mp4 --source auto --output ./videos/
 ```
 
-`--source auto` checks the account's `accessible_features` for `studio`. It uses Studio when available; otherwise it calls library authorization once, then prepares the signed URL. Suno's public bundle directly confirms Library MP3/M4A and the Studio preparation route; Library WAV uses Suno's conversion-and-polling flow. `--video` remains as a compatibility shortcut for MP4. MP3 downloads embed lyrics via ID3 tags:
+`--source mango` (default) fetches the progressive `m4a-opus` / `webm-opus` stream from `media_urls`, unwraps the AES-128-CTR key/iv via `POST /api/mango/rights` (using `SHA-256(jwt)` as the AES-256-GCM KEK and the clip ID as AAD), decrypts the stream locally, and either saves raw `.m4a` directly or transcodes to `.mp3` / `.wav` / `.mp4` via local `ffmpeg`. `--source auto` checks the account's `accessible_features` for `studio`, uses Studio when available, or tries Library authorization and automatically falls back to `mango` when download quota is exhausted. `--video` remains as a compatibility shortcut for MP4. MP3 downloads embed lyrics via ID3 tags:
 
 - **USLT** (plain lyrics) — shown in most music players
 - **SYLT** (synced word-by-word timestamps) — shown in Apple Music with timing

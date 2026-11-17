@@ -17,9 +17,9 @@ pub fn clips(clips: &[Clip]) {
             .map(|d| format!("{:.0}s", d))
             .unwrap_or_default();
         let tags = c.metadata.tags.as_deref().unwrap_or("-");
-        let short_id = if c.id.len() > 8 { &c.id[..8] } else { &c.id };
+        let multiline_id = format_multiline_id(&c.id);
         table.add_row(vec![
-            short_id,
+            &multiline_id,
             &c.title,
             &c.status,
             &c.model_name,
@@ -28,6 +28,18 @@ pub fn clips(clips: &[Clip]) {
         ]);
     }
     println!("{table}");
+}
+
+fn format_multiline_id(id: &str) -> String {
+    let parts: Vec<&str> = id.split('-').collect();
+    if parts.len() == 5 {
+        format!(
+            "{}-\n{}-\n{}-\n{}-\n{}",
+            parts[0], parts[1], parts[2], parts[3], parts[4]
+        )
+    } else {
+        id.to_string()
+    }
 }
 
 pub fn billing(info: &BillingInfo) {

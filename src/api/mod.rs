@@ -101,6 +101,10 @@ impl SunoClient {
             .headers(self.headers())
     }
 
+    pub(crate) fn current_jwt(&self) -> Option<String> {
+        self.auth.lock().expect("auth mutex poisoned").jwt.clone()
+    }
+
     fn headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         // Lock briefly, clone the strings we need, drop the guard before

@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 
 // --- Billing / Account ---
 
-/// Only `total_credits_left` and `plan` are load-bearing (auth verify,
-/// credits display). Everything else defaults so one renamed/removed field
-/// in Suno's billing response doesn't break credits+models+auth at once.
+/// Only `total_credits_left` is load-bearing (auth verify, credits display).
+/// Everything else defaults (including `plan: null` on free accounts) so one
+/// renamed/removed/nullable field in Suno's billing response doesn't break
+/// credits+models+auth at once.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BillingInfo {
     #[serde(default)]
@@ -16,6 +17,7 @@ pub struct BillingInfo {
     pub monthly_limit: u64,
     #[serde(default)]
     pub is_active: bool,
+    #[serde(default, deserialize_with = "deserialize_plan_or_default")]
     pub plan: Plan,
     #[serde(default)]
     pub models: Vec<Model>,
@@ -31,6 +33,13 @@ pub struct BillingInfo {
     pub download_usage: Option<serde_json::Value>,
 }
 
+fn deserialize_plan_or_default<'de, D>(deserializer: D) -> Result<Plan, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Plan>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Plan {
     pub name: String,
@@ -38,6 +47,16 @@ pub struct Plan {
     pub plan_key: String,
     #[serde(default)]
     pub usage_plan_features: Vec<Feature>,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Self {
+            name: "Free".to_string(),
+            plan_key: String::new(),
+            usage_plan_features: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -87,6 +106,16 @@ pub struct RemasterModelInfo {
 // --- Clips / Feed ---
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MediaUrl {
+    pub url: String,
+    pub content_type: String,
+    #[serde(default)]
+    pub delivery: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Clip {
     pub id: String,
     pub title: String,
@@ -96,6 +125,8 @@ pub struct Clip {
     pub video_url: Option<String>,
     pub image_url: Option<String>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_urls: Vec<MediaUrl>,
     #[serde(default)]
     pub play_count: u64,
     #[serde(default)]
@@ -481,12 +512,17 @@ mod tests {
 
     #[test]
     fn billing_info_tolerates_missing_noncritical_fields() {
-        // Only total_credits_left and plan are required.
+        // Only total_credits_left is required; plan can be null on free accounts.
         let r: BillingInfo =
             serde_json::from_str(r#"{"total_credits_left": 500, "plan": {"name": "Premier"}}"#)
                 .unwrap();
         assert_eq!(r.total_credits_left, 500);
         assert_eq!(r.plan.name, "Premier");
         assert!(r.models.is_empty());
+
+        let free: BillingInfo =
+            serde_json::from_str(r#"{"total_credits_left": 90, "plan": null}"#).unwrap();
+        assert_eq!(free.total_credits_left, 90);
+        assert_eq!(free.plan.name, "Free");
     }
 }

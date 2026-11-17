@@ -789,8 +789,8 @@ pub struct DownloadArgs {
     #[arg(long, value_enum, default_value_t = DownloadFormat::Mp3, conflicts_with = "video")]
     pub format: DownloadFormat,
 
-    /// auto uses Studio when the account has access, otherwise the library route
-    #[arg(long, value_enum, default_value_t = DownloadSource::Auto)]
+    /// mango (default) uses playback-source decryption; auto uses Studio when the account has access, otherwise library
+    #[arg(long, value_enum, default_value_t = DownloadSource::Mango)]
     pub source: DownloadSource,
 }
 
@@ -1057,10 +1057,11 @@ impl DownloadFormat {
 }
 #[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DownloadSource {
-    #[default]
     Auto,
     Studio,
     Library,
+    #[default]
+    Mango,
 }
 fn percentage(value: &str) -> Result<f64, String> {
     let n: f64 = value

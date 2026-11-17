@@ -60,18 +60,20 @@ pub(crate) async fn handle_generation(
     };
     let mut failure = None;
     if let Some(dir) = download_dir {
-        let source = c
-            .download_source(DownloadSource::Auto, DownloadFormat::Mp3)
-            .await
-            .map_err(|e| generation_recovery(e, &ids))?;
         for clip in &mut clips {
             if clip.status != "complete" {
                 continue;
             }
             let result: Result<(), CliError> = async {
-                let path =
-                    download::download_clip(c, clip, dir, DownloadFormat::Mp3, source, quiet)
-                        .await?;
+                let path = download::download_clip(
+                    c,
+                    clip,
+                    dir,
+                    DownloadFormat::Mp3,
+                    DownloadSource::Mango,
+                    quiet,
+                )
+                .await?;
                 clip.local_path = Some(path.clone());
                 let aligned = if clip.metadata.make_instrumental {
                     None

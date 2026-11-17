@@ -1,5 +1,8 @@
 //! Current Suno file preparation, separate from playback and byte transfer.
-use super::{SunoClient, types::Clip};
+use super::{
+    SunoClient,
+    types::{Clip, MediaUrl},
+};
 use crate::{
     cli::{DownloadFormat, DownloadSource},
     errors::CliError,
@@ -17,7 +20,51 @@ struct PreparedDownload {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MangoRights {
+    pub key: String,
+    pub iv: String,
+    pub glt: Option<String>,
+}
+
 impl SunoClient {
+    pub async fn clip_detail(&self, id: &str) -> Result<Clip, CliError> {
+        self.with_auth_retry(|| async {
+            let resp = self.get(&format!("/api/clip/{id}")).send().await?;
+            Ok(self.check_response(resp).await?.json().await?)
+        })
+        .await
+    }
+
+    pub async fn mango_rights(&self, id: &str) -> Result<MangoRights, CliError> {
+        self.with_auth_retry(|| async {
+            let resp = self
+                .post("/api/mango/rights")
+                .json(&serde_json::json!({
+                    "content_params": {
+                        "content_id": id,
+                        "content_type": "clip"
+                    }
+                }))
+                .send()
+                .await?;
+            Ok(self.check_response(resp).await?.json().await?)
+        })
+        .await
+    }
+
+    pub fn select_mango_media<'a>(media: &'a [MediaUrl]) -> Option<&'a MediaUrl> {
+        for content_type in ["m4a-opus", "webm-opus"] {
+            if let Some(m) = media
+                .iter()
+                .find(|m| m.content_type == content_type && m.delivery == "progressive")
+            {
+                return Some(m);
+            }
+        }
+        None
+    }
+
     pub async fn download_source(
         &self,
         source: DownloadSource,
@@ -30,17 +77,25 @@ impl SunoClient {
             return Ok(DownloadSource::Library);
         }
         let billing = self.billing_info().await?;
-        Ok(
-            if billing
-                .accessible_features
-                .iter()
-                .any(|f| f.name == "studio")
+        if billing
+            .accessible_features
+            .iter()
+            .any(|f| f.name == "studio")
+        {
+            return Ok(DownloadSource::Studio);
+        }
+        if let Some(usage) = &billing.download_usage {
+            let used = usage["current_period_downloads_used"].as_u64();
+            let limit = usage["current_period_downloads_limit"].as_u64();
+            let extra = usage["additional_download_remaining"].as_u64().unwrap_or(0);
+            if let (Some(u), Some(l)) = (used, limit)
+                && u >= l
+                && extra == 0
             {
-                DownloadSource::Studio
-            } else {
-                DownloadSource::Library
-            },
-        )
+                return Ok(DownloadSource::Mango);
+            }
+        }
+        Ok(DownloadSource::Library)
     }
 
     pub async fn prepare_download(

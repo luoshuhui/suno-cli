@@ -350,10 +350,10 @@ fn domain_annotations() -> serde_json::Map<String, Value> {
                 "options": [
                     {"name": "--output", "type": "string", "required": false, "default": ". (config `output_dir`)", "description": "Output directory"},
                     {"name": "--format", "type": "string", "required": false, "default": "mp3", "values": ["mp3", "wav", "m4a", "mp4"], "description": "Prepared file format"},
-                    {"name": "--source", "type": "string", "required": false, "default": "auto", "values": ["auto", "studio", "library"], "description": "Preparation route; auto uses Studio when the account has access, otherwise the library route"},
+                    {"name": "--source", "type": "string", "required": false, "default": "mango", "values": ["auto", "studio", "library", "mango"], "description": "Download route; mango (default) uses playback-source decryption with local ffmpeg transcoding; auto uses Studio when the account has access, otherwise library"},
                     {"name": "--video", "type": "bool", "required": false, "default": false, "description": "Compatibility shortcut for --format mp4; conflicts with an explicit --format"}
                 ],
-                "transport": "All formats use Suno's signed download-preparation APIs. Prepared URLs are short-lived HTTPS URLs; auto selects Studio when the account has access and otherwise uses the library route."
+                "transport": "All formats use Suno's signed download-preparation APIs or mango playback-source decryption (with local ffmpeg transcoding when needed). Prepared URLs are short-lived HTTPS URLs; auto selects Studio when the account has access and otherwise uses the library route (falling back to mango if download quota is exhausted)."
             }),
         ),
         (

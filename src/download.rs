@@ -1,33 +1,323 @@
 use std::path::Path;
 use std::time::Duration;
 
+use aes_gcm::{
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 
 use id3::TagLike;
 
+use crate::api::downloads::MangoRights;
 use crate::api::types::{AlignedWord, Clip};
+use crate::cli::{DownloadFormat, DownloadSource};
 use crate::errors::CliError;
+
+type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 pub async fn download_clip(
     client: &crate::api::SunoClient,
     clip: &Clip,
     output_dir: &str,
-    format: crate::cli::DownloadFormat,
-    source: crate::cli::DownloadSource,
+    format: DownloadFormat,
+    source: DownloadSource,
     quiet: bool,
 ) -> Result<String, CliError> {
-    let source = client.download_source(source, format).await?;
-    let url = client.prepare_download(clip, format, source).await?;
+    if source == DownloadSource::Mango {
+        return download_clip_mango(client, clip, output_dir, format, quiet).await;
+    }
+    let resolved = client.download_source(source, format).await?;
+    if resolved == DownloadSource::Mango {
+        return download_clip_mango(client, clip, output_dir, format, quiet).await;
+    }
+    let url = match client.prepare_download(clip, format, resolved).await {
+        Ok(url) => url,
+        Err(e) if source == DownloadSource::Auto => {
+            if !quiet {
+                eprintln!("Official download unavailable ({e}), falling back to mango playback decryption...");
+            }
+            return download_clip_mango(client, clip, output_dir, format, quiet).await;
+        }
+        Err(e) => return Err(e),
+    };
     match transfer(clip, output_dir, format.extension(), &url, quiet).await {
         Err(CliError::Http(e)) if matches!(e.status().map(|s| s.as_u16()), Some(401 | 403)) => {
             let fresh = client
-                .prepared_download_url(&clip.id, format, source)
+                .prepared_download_url(&clip.id, format, resolved)
                 .await?;
             transfer(clip, output_dir, format.extension(), &fresh, quiet).await
         }
         result => result,
     }
+}
+
+fn is_ftyp(bytes: &[u8]) -> bool {
+    bytes.len() > 8 && &bytes[4..8] == b"ftyp"
+}
+
+fn is_webm(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[0..4] == [26, 69, 223, 163]
+}
+
+fn is_valid_mango_container(bytes: &[u8], ext: &str) -> bool {
+    if ext == "webm" {
+        is_webm(bytes)
+    } else {
+        is_ftyp(bytes)
+    }
+}
+
+fn unwrap_mango_secret(
+    kek_bytes: &[u8],
+    b64_wrapped: &str,
+    clip_id: &str,
+) -> Result<Vec<u8>, CliError> {
+    let wrapped = BASE64
+        .decode(b64_wrapped)
+        .map_err(|e| CliError::Download(format!("invalid base64 in mango rights: {e}")))?;
+    if wrapped.len() < 13 {
+        return Err(CliError::Download("mango rights key/iv too short".into()));
+    }
+    let cipher = Aes256Gcm::new_from_slice(kek_bytes)
+        .map_err(|_| CliError::Download("invalid KEK length".into()))?;
+    let nonce = Nonce::from_slice(&wrapped[..12]);
+    let payload = Payload {
+        msg: &wrapped[12..],
+        aad: clip_id.as_bytes(),
+    };
+    cipher
+        .decrypt(nonce, payload)
+        .map_err(|_| CliError::Download("AES-GCM key unwrap failed".into()))
+}
+
+pub fn decrypt_mango_audio(
+    mut data: Vec<u8>,
+    ext: &str,
+    clip_id: &str,
+    jwt: Option<&str>,
+    rights: &MangoRights,
+) -> Result<Vec<u8>, CliError> {
+    if is_valid_mango_container(&data, ext) {
+        return Ok(data);
+    }
+    let kek_input = jwt
+        .or(rights.glt.as_deref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CliError::Download("missing JWT or guest token for mango decryption".into()))?;
+    let kek = Sha256::digest(kek_input.as_bytes());
+    let key_raw = unwrap_mango_secret(&kek, &rights.key, clip_id)?;
+    let iv_raw = unwrap_mango_secret(&kek, &rights.iv, clip_id)?;
+    let mut ctr = Aes128Ctr::new_from_slices(&key_raw, &iv_raw)
+        .map_err(|_| CliError::Download("invalid AES-128-CTR key/iv length".into()))?;
+    ctr.apply_keystream(&mut data);
+    if !is_valid_mango_container(&data, ext) {
+        return Err(CliError::Download(format!(
+            "mango decrypted audio is not a valid {ext} container"
+        )));
+    }
+    Ok(data)
+}
+
+async fn download_clip_mango(
+    client: &crate::api::SunoClient,
+    clip: &Clip,
+    output_dir: &str,
+    format: DownloadFormat,
+    quiet: bool,
+) -> Result<String, CliError> {
+    if clip.status != "complete" {
+        return Err(CliError::Download(format!(
+            "clip {} is {}; wait for completion with `suno status {} --wait`",
+            clip.id, clip.status, clip.id
+        )));
+    }
+    let mut media_list = clip.media_urls.clone();
+    let mut image_url = clip.image_url.clone();
+    if crate::api::SunoClient::select_mango_media(&media_list).is_none() {
+        let detailed = client.clip_detail(&clip.id).await?;
+        media_list = detailed.media_urls;
+        if image_url.is_none() {
+            image_url = detailed.image_url;
+        }
+    }
+    let media = crate::api::SunoClient::select_mango_media(&media_list).ok_or_else(|| {
+        CliError::Download(format!(
+            "no progressive M4A/WebM playback stream found for clip {}",
+            clip.id
+        ))
+    })?;
+    let raw_ext = if media.content_type == "webm-opus" {
+        "webm"
+    } else {
+        "m4a"
+    };
+
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .read_timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| CliError::Http(e.without_url()))?;
+
+    let resp = http
+        .get(&media.url)
+        .send()
+        .await
+        .map_err(|e| CliError::Http(e.without_url()))?
+        .error_for_status()
+        .map_err(|e| CliError::Http(e.without_url()))?;
+
+    let enc_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| CliError::Http(e.without_url()))?
+        .to_vec();
+
+    let plain_bytes = if is_valid_mango_container(&enc_bytes, raw_ext) {
+        enc_bytes
+    } else {
+        let rights = client.mango_rights(&clip.id).await?;
+        let jwt = client.current_jwt();
+        decrypt_mango_audio(enc_bytes, raw_ext, &clip.id, jwt.as_deref(), &rights)?
+    };
+
+    let target_ext = format.extension();
+    let filename = clip_filename(&clip.title, &clip.id, target_ext);
+    tokio::fs::create_dir_all(output_dir).await?;
+    let final_path = Path::new(output_dir).join(&filename);
+    let uid = uuid::Uuid::new_v4();
+    let raw_tmp = final_path.with_extension(format!("{raw_ext}.{uid}.raw.part"));
+    let out_tmp = final_path.with_extension(format!("{target_ext}.{uid}.part"));
+
+    tokio::fs::write(&raw_tmp, &plain_bytes).await?;
+
+    if format == DownloadFormat::M4a && raw_ext == "m4a" {
+        if let Err(e) = tokio::fs::rename(&raw_tmp, &final_path).await {
+            let _ = tokio::fs::remove_file(&raw_tmp).await;
+            return Err(e.into());
+        }
+        return Ok(std::fs::canonicalize(&final_path)?.display().to_string());
+    }
+
+    if !quiet {
+        eprintln!("Transcoding decrypted {raw_ext} to {target_ext} via ffmpeg...");
+    }
+
+    let transcode_res = transcode_with_ffmpeg(
+        &http,
+        &raw_tmp,
+        &out_tmp,
+        format,
+        image_url.as_deref(),
+    )
+    .await;
+    let _ = tokio::fs::remove_file(&raw_tmp).await;
+    if let Err(e) = transcode_res {
+        let _ = tokio::fs::remove_file(&out_tmp).await;
+        return Err(e);
+    }
+
+    if let Err(e) = validate_audio_file(&out_tmp, target_ext).await {
+        let _ = tokio::fs::remove_file(&out_tmp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&out_tmp, &final_path).await {
+        let _ = tokio::fs::remove_file(&out_tmp).await;
+        return Err(e.into());
+    }
+    Ok(std::fs::canonicalize(&final_path)?.display().to_string())
+}
+
+async fn transcode_with_ffmpeg(
+    http: &reqwest::Client,
+    input_path: &Path,
+    output_path: &Path,
+    format: DownloadFormat,
+    image_url: Option<&str>,
+) -> Result<(), CliError> {
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.arg("-y").arg("-v").arg("error");
+
+    let mut cover_tmp = None;
+    if format == DownloadFormat::Mp4
+        && let Some(url) = image_url.filter(|u| u.starts_with("https://"))
+        && let Ok(resp) = http.get(url).send().await
+        && let Ok(resp) = resp.error_for_status()
+        && let Ok(bytes) = resp.bytes().await
+    {
+        let tmp_img = output_path.with_extension("cover.jpg.part");
+        if tokio::fs::write(&tmp_img, &bytes).await.is_ok() {
+            cover_tmp = Some(tmp_img);
+        }
+    }
+
+    if let Some(ref img) = cover_tmp {
+        cmd.arg("-loop").arg("1").arg("-i").arg(img);
+    }
+    cmd.arg("-i").arg(input_path);
+
+    match format {
+        DownloadFormat::Mp3 => {
+            cmd.args(["-vn", "-c:a", "libmp3lame", "-q:a", "2", "-f", "mp3"]);
+        }
+        DownloadFormat::Wav => {
+            cmd.args(["-vn", "-c:a", "pcm_s16le", "-f", "wav"]);
+        }
+        DownloadFormat::M4a => {
+            cmd.args(["-vn", "-c:a", "aac", "-b:a", "192k", "-f", "ipod"]);
+        }
+        DownloadFormat::Mp4 => {
+            if cover_tmp.is_some() {
+                cmd.args([
+                    "-c:v",
+                    "libx264",
+                    "-tune",
+                    "stillimage",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-vf",
+                    "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    "-f",
+                    "mp4",
+                ]);
+            } else {
+                cmd.args(["-c:a", "aac", "-b:a", "192k", "-f", "mp4"]);
+            }
+        }
+    }
+    cmd.arg(output_path);
+
+    let output = cmd.output().await.map_err(|e| {
+        CliError::Download(format!(
+            "failed to run ffmpeg for transcoding (is ffmpeg installed?): {e}"
+        ))
+    });
+    if let Some(img) = cover_tmp {
+        let _ = tokio::fs::remove_file(img).await;
+    }
+    let output = output?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::Download(format!(
+            "ffmpeg transcoding failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
 }
 
 async fn transfer(
@@ -305,5 +595,81 @@ mod tests {
             "夜の歌-remix-01234567.mp3"
         );
         assert_eq!(clip_filename("short", "abc", "mp3"), "short-abc.mp3");
+    }
+
+    #[test]
+    fn decrypts_mango_m4a_and_webm_with_jwt_or_glt() {
+        for (ext, plain) in [
+            ("m4a", &[0, 0, 0, 12, b'f', b't', b'y', b'p', 0][..]),
+            ("webm", &[26, 69, 223, 163, 0, 0, 0, 0, 0][..]),
+        ] {
+            for use_jwt in [true, false] {
+                let clip_id = "synthetic-id";
+                let token = if use_jwt {
+                    "synthetic-session"
+                } else {
+                    "synthetic-guest"
+                };
+                let key_raw = [7u8; 16];
+                let iv_raw = [8u8; 16];
+
+                let mut encrypted = plain.to_vec();
+                let mut ctr = Aes128Ctr::new_from_slices(&key_raw, &iv_raw).unwrap();
+                ctr.apply_keystream(&mut encrypted);
+
+                let kek = Sha256::digest(token.as_bytes());
+                let gcm = Aes256Gcm::new_from_slice(&kek).unwrap();
+                let wrap = |secret: &[u8], nonce_byte: u8| -> String {
+                    let nonce_bytes = [nonce_byte; 12];
+                    let nonce = Nonce::from_slice(&nonce_bytes);
+                    let ciphertext = gcm
+                        .encrypt(
+                            nonce,
+                            Payload {
+                                msg: secret,
+                                aad: clip_id.as_bytes(),
+                            },
+                        )
+                        .unwrap();
+                    let mut combined = nonce_bytes.to_vec();
+                    combined.extend_from_slice(&ciphertext);
+                    BASE64.encode(combined)
+                };
+
+                let rights = MangoRights {
+                    key: wrap(&key_raw, 1),
+                    iv: wrap(&iv_raw, 2),
+                    glt: if use_jwt {
+                        None
+                    } else {
+                        Some(token.to_string())
+                    },
+                };
+
+                let out = decrypt_mango_audio(
+                    encrypted,
+                    ext,
+                    clip_id,
+                    if use_jwt { Some(token) } else { None },
+                    &rights,
+                )
+                .unwrap();
+                assert_eq!(out, plain);
+
+                let unencrypted_out = decrypt_mango_audio(
+                    plain.to_vec(),
+                    ext,
+                    clip_id,
+                    None,
+                    &MangoRights {
+                        key: String::new(),
+                        iv: String::new(),
+                        glt: None,
+                    },
+                )
+                .unwrap();
+                assert_eq!(unencrypted_out, plain);
+            }
+        }
     }
 }
